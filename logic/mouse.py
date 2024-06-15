@@ -3,11 +3,16 @@ import win32con, win32api
 from ctypes import *
 from os import path
 import torch.nn as nn
-
+import time
 from logic.buttons import Buttons
 from logic.config_watcher import cfg
 from logic.visual import visuals
 
+try:
+    import torch2trt
+except ImportError:
+    print("torch2trt is not installed. git clone https://github.com/NVIDIA-AI-IOT/torch2trt than cd torch2trt than python setup.py install'")
+    exit()
 if cfg.arduino_move or cfg.arduino_shoot:
     from logic.arduino import arduino
 
@@ -111,10 +116,29 @@ class MouseThread():
         self.center_y = self.screen_height / 2
         self.prev_x = 0
         self.prev_y = 0
-        
         self.bScope = False
         self.button_pressed = False
-        
+        # PID controller parameters
+        self.kp = 0.12  # Proportional gain (tune this for responsiveness)
+        self.ki = 0.00001  # Integral gain (tune this for steady-state accuracy)
+        self.kd = 0.00001  # Derivative gain (tune this for overshoot control)
+        self.integral_x = 0
+        self.integral_y = 0
+        self.last_error_x = 0
+        self.last_error_y = 0
+        self.last_time = time.time()
+        self.prediction_time = 5
+        # Smoothing parameters
+        self.smoothing_factor = 0.15  # Adjust for smoother or more responsive movement
+        self.smoothed_move_x = 0
+        self.smoothed_move_y = 0
+         # Convert model to TensorRT (only if torch2trt is available)
+        try:
+            self.model_trt = torch2trt.torch2trt(self.model, [torch.randn(1, 10).to(self.device)], fp16_mode=True)  # Assuming fp16 is suitable
+        except Exception as e:
+            print("Error converting model to TensorRT:", e)
+            print("Falling back to PyTorch model")
+            self.model_trt = None
         self.arch = f'cuda:{cfg.AI_device}'
         
         if cfg.AI_enable_AMD:
@@ -174,41 +198,58 @@ class MouseThread():
     
     def calc_movement(self, target_x, target_y):
         if cfg.AI_mouse_net == False:
-            offset_x = target_x - self.center_x
-            offset_y = target_y - self.center_y
+           # PID calculation 
+           velocity_x = target_x - self.prev_x
+           velocity_y = target_y - self.prev_y
+           predicted_x = target_x + velocity_x * self.prediction_time  # Tune prediction_time
+           predicted_y = target_y + velocity_y * self.prediction_time
+           error_x = predicted_x - self.center_x
+           error_y = predicted_y - self.center_y
+           
+           current_time = time.time()
+           dt = current_time - self.last_time
+           self.last_time = current_time
 
-            degrees_per_pixel_x = self.fov_x / self.screen_width
-            degrees_per_pixel_y = self.fov_y / self.screen_height
-            
-            mouse_move_x = offset_x * degrees_per_pixel_x
+           # Proportional term
+           prop_x = self.kp * error_x
+           prop_y = self.kp * error_y
 
-            move_x = (mouse_move_x / 360) * (self.dpi * (1 / self.mouse_sensitivity))
+           # Integral term (with anti-windup protection)
+           self.integral_x += error_x * dt
+           self.integral_y += error_y * dt
+           integral_x = self.ki * self.integral_x
+           integral_y = self.ki * self.integral_y
 
-            mouse_move_y = offset_y * degrees_per_pixel_y
-            move_y = (mouse_move_y / 360) * (self.dpi * (1 / self.mouse_sensitivity))
-            
-            if cfg.show_window and cfg.show_target_prediction_line:
-                visuals.draw_predicted_position(target_x, target_y)
-                
-            return move_x, move_y
-        else:
-            input_data = [self.screen_width,
-                        self.screen_height,
-                        self.center_x,
-                        self.center_y,
-                        self.dpi,
-                        self.mouse_sensitivity,
-                        self.fov_x,
-                        self.fov_y,
-                        target_x,
-                        target_y]
-            
-            input_tensor = torch.tensor(input_data, dtype=torch.float32).to(self.device)
+           # Derivative term
+           deriv_x = self.kd * (error_x - self.last_error_x) / dt
+           deriv_y = self.kd * (error_y - self.last_error_y) / dt
+           self.last_error_x = error_x
+           self.last_error_y = error_y
+
+           # Calculate total PID output and convert to mouse movement
+           move_x = prop_x + integral_x + deriv_x
+           move_y = prop_y + integral_y + deriv_y
+           
         
+        else:  # Use TensorRT or PyTorch for AI_mouse_net
+            input_data = [self.screen_width, self.screen_height, self.center_x, self.center_y, self.dpi,
+                         self.mouse_sensitivity, self.fov_x, self.fov_y, target_x, target_y]
+            input_tensor = torch.tensor(input_data, dtype=torch.float32).to(self.device)
+
             with torch.no_grad():
-                move = self.model(input_tensor).cpu().numpy()
-            
-            return move[0], move[1]
+                if self.model_trt:  # Use TensorRT if available
+                   move = self.model_trt(input_tensor).cpu().numpy()
+                else:  # Fallback to PyTorch
+                    move = self.model(input_tensor).cpu().numpy()
+
+            move_x = move[0]
+            move_y = move[1]
+
+        # Apply exponential smoothing
+        self.smoothed_move_x = self.smoothing_factor * move_x + (1 - self.smoothing_factor) * self.smoothed_move_x
+        self.smoothed_move_y = self.smoothing_factor * move_y + (1 - self.smoothing_factor) * self.smoothed_move_y
+
+        return self.smoothed_move_x, self.smoothed_move_y
         
     def move_mouse(self, x, y):
         if x == None:
